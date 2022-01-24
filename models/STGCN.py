@@ -119,7 +119,7 @@ class OutputLayer(nn.Module):
         # (batch_size, input_dim(c), 1, num_nodes)
         x_ln = self.ln(x_t1.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         # (batch_size, input_dim(c), 1, num_nodes)
-        x_t2 = self.tconv2(x_ln).squeeze()
+        x_t2 = self.tconv2(x_ln).squeeze(2)
         # (batch_size, input_dim(c), num_nodes)
         return x_t2
 

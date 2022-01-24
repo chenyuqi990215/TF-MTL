@@ -61,6 +61,7 @@ def parse_arg():
     parser.add_argument('--keep_prob', '-keep_prob', required=False, default=0.5, type=float)
     parser.add_argument('--load_pretrain', '-load_pretrain', required=False, default='', type=str)
     parser.add_argument('--verbose', '-verbose', action='store_true', default=False)
+    parser.add_argument('--gnn', '-gnn', required=False, default='GCN', choices=['GCN', 'GAT', 'AGC-LSTM'])
     args = parser.parse_args()
     args.root = os.path.join(args.data_root, args.dataset)
     if not args.enable_cuda or not torch.cuda.is_available():
@@ -79,7 +80,6 @@ def train(args, net, train_loader, val_loader, optimizer, scheduler, early_stopp
     for i in range(args.epoch):
         net.train()
         for batch in (tqdm.tqdm(train_loader) if args.verbose else train_loader):
-            optimizer.zero_grad()
             batch = {key: batch[key].to(args.device) for key in batch.keys()}
             loss = net.calculate_loss(batch)
 
@@ -88,6 +88,7 @@ def train(args, net, train_loader, val_loader, optimizer, scheduler, early_stopp
 
             l_sum += loss.item() * batch['anchor_y'].size()[0]
             n_sum += batch['anchor_y'].size()[0]
+            optimizer.zero_grad()
 
         val_loss = val(net, val_loader, args.device)
         if args.enable_earlystop:

@@ -39,16 +39,54 @@ class SpatioConvLayer(nn.Module):
         init.uniform_(self.b, -bound, bound)
 
     def forward(self, x):
-        # Lk: (Ks, num_nodes, num_nodes)
-        # x:  (batch_size, c_in, num_nodes)
-        # x_c: (batch_size, c_in, Ks, num_nodes)
-        # theta: (c_in, c_out, Ks)
-        # x_gc: (batch_size, c_out, input_length, num_nodes)
-        # return: (batch_size, c_out, num_nodes)
+        x = x.transpose(-1, -2)
         x_c = torch.einsum("knm,bim->bikn", self.Lk, x)  # delete num_nodes(n)
         x_gc = torch.einsum("iok,bikn->bon", self.theta, x_c) + self.b  # delete Ks(k) c_in(i)
         x_in = self.align(x.unsqueeze(1)).squeeze()  # (batch_size, c_out, num_nodes)
-        return torch.relu(x_gc + x_in)  # residual connection
+        return torch.relu(x_gc + x_in).transpose(-1, -2)  # residual connection
+
+
+class GraphAttentionLayer(nn.Module):
+    """
+    Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
+    图注意力层
+    """
+
+    def __init__(self, in_features, out_features, dropout=0.2, alpha=0.01):
+        super(GraphAttentionLayer, self).__init__()
+        self.in_features = in_features  # 节点表示向量的输入特征维度
+        self.out_features = out_features  # 节点表示向量的输出特征维度
+        self.dropout = dropout  # dropout参数
+        self.alpha = alpha  # leakyrelu激活的参数
+
+        # 定义可训练参数，即论文中的W和a
+        self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
+        nn.init.xavier_uniform_(self.W.data, gain=1.414)  # xavier初始化
+        self.a = nn.Parameter(torch.zeros(size=(2 * out_features, 1)))
+        nn.init.xavier_uniform_(self.a.data, gain=1.414)  # xavier初始化
+
+        # 定义leakyrelu激活函数
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+
+    def forward(self, inp):
+        """
+        implement of global graph attention layer
+        inp: input_fea [N, in_features]  in_features表示节点的输入特征向量元素个数
+        """
+        h = torch.matmul(inp, self.W)  # [B, N, out_features]
+        N = h.size()[1]  # N 图的节点数
+        B = h.size()[0]  # B batch_size
+
+        a_input = torch.cat([h.repeat(1, 1, N).view(B, N * N, -1), h.repeat(1, N, 1)], dim=-1).view(B, N, N, 2 * self.out_features)
+        # [B, N, N, 2*out_features]
+        attention = self.leakyrelu(torch.matmul(a_input, self.a).squeeze())
+        # [B, N, N, 1] => [B, N, N] 图注意力的相关系数（未归一化）
+
+        attention = F.softmax(attention, dim=-1)  # softmax形状保持不变 [N, N]，得到归一化的注意力权重！
+        attention = F.dropout(attention, self.dropout)  # dropout，防止过拟合
+        h_prime = torch.matmul(attention, h)  # [B, N, N].[B, N, out_features] => [B, N, out_features]
+
+        return F.elu(h_prime)
 
 
 class AbstractModel(nn.Module):
@@ -133,12 +171,17 @@ class EncDec(AbstractModel):
         super(EncDec, self).__init__(model, config, scalar)
         self.lstm = nn.LSTM(hidden_size=config.out_dim, input_size=config.enc_dim, batch_first=True)
         self.fc = nn.Linear(config.out_dim, 1)
-        self.gnn = SpatioConvLayer(config.Ks, config.out_dim, config.out_dim, config.Lk, config.device)
+        if config.gnn == 'GAT':
+            self.gnn = GraphAttentionLayer(config.out_dim, config.out_dim)
+        elif config.gnn == 'GCN':
+            self.gnn = SpatioConvLayer(config.Ks, config.out_dim, config.out_dim, config.Lk, config.device)
+        else:
+            raise NotImplementedError
         self.norm = nn.LayerNorm([config.num_nodes, config.out_dim])
         self.align = Align(config.out_dim, config.out_dim)
         self.relu = nn.ReLU()
 
-    def decoder(self, enc):
+    def decoder_gnn(self, enc):
         '''
         :param enc: (batch_size, num_nodes, enc_dim)
         :return: (batch_size, num_nodes, n_pred, out_dim)
@@ -153,9 +196,8 @@ class EncDec(AbstractModel):
             decoder_output, (h, c) = self.lstm(input_embed, (h, c))  # [batch_size * num_nodes, 1, out_dim]
             decoder_output = decoder_output.reshape(enc.size()[0], enc.size()[1], -1)
             outputs.append(decoder_output.unsqueeze(2))  # (batch_size, num_nodes, 1, out_dim)
-            decoder_output = decoder_output.permute(0, 2, 1)
             decoder_output = self.gnn(decoder_output)
-            decoder_output = self.norm(decoder_output.transpose(-1, -2))
+            decoder_output = self.norm(decoder_output)
             decoder_output = decoder_output.reshape(enc.size()[0] * enc.size()[1], -1)
             input_embed = input_embed.reshape(enc.size()[0], enc.size()[1], 1, -1).permute(0, 3, 2, 1)
             input_embed = self.align(input_embed).permute(0, 3, 2, 1).reshape(enc.size()[0] * enc.size()[1], -1)
@@ -164,7 +206,12 @@ class EncDec(AbstractModel):
 
     def forward(self, batch):
         enc = self.model.encoder(batch['anchor_x'])
-        dec = self.decoder(enc)
+        if self.config.gnn == 'GCN':
+            dec = self.decoder_gnn(enc)
+        elif self.config.gnn == 'GAT':
+            dec = self.decoder_gnn(enc)
+        else:
+            raise NotImplementedError
         return self.fc(dec).squeeze()
 
     def predict(self, batch):
@@ -228,6 +275,7 @@ class Config:
         self.out_dim = 128
         self.margin = 1
         self.beta = 0.5
+        self.gnn = 'GCN'
 
 if __name__ == "__main__":
     from utils.scaler import StandardScaler
@@ -235,7 +283,7 @@ if __name__ == "__main__":
     scalar = StandardScaler(0, 1)
     from models.STGCN import STGCN
     model = STGCN(config)
-    net = DecTriplet(model, config, scalar)
+    net = EncDec(model, config, scalar)
     batch = {
         'anchor_x': torch.rand(102, 1125, 12, 1),
         'positive_x': torch.rand(102, 1125, 12, 1),
