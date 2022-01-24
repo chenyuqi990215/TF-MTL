@@ -28,7 +28,7 @@ class SpatioConvLayer(nn.Module):
         super(SpatioConvLayer, self).__init__()
         self.Lk = lk
         self.theta = nn.Parameter(torch.FloatTensor(c_in, c_out, ks).to(device))  # kernel: C_in*C_out*ks
-        self.b = nn.Parameter(torch.FloatTensor(1, c_out, 1, 1).to(device))
+        self.b = nn.Parameter(torch.FloatTensor(1, c_out, 1).to(device))
         self.align = Align(c_in, c_out)
         self.reset_parameters()
 
@@ -64,8 +64,11 @@ class AbstractModel(nn.Module):
     def predict(self, batch):
         pass
 
-    def calculate_loss(self, batch):
+    def calculate_loss(self, batch, is_valid=False):
         pass
+
+    def supervised_loss(self, y_predicted, y_true):
+        return masked_mae(y_predicted, y_true, 0.0)
 
 
 class BaseLine(AbstractModel):
@@ -80,10 +83,10 @@ class BaseLine(AbstractModel):
     def predict(self, batch):
         return self.forward(batch)
 
-    def calculate_loss(self, batch):
-        y_predicted = self.forward(batch)
-        y_true = self.scaler.inverse_transform(batch['anchor_y'])
-        return masked_mae(y_predicted, y_true, 0.0)
+    def calculate_loss(self, batch, is_valid=False):
+        y_predicted = self.scalar.inverse_transform(self.forward(batch))
+        y_true = batch['anchor_y'].squeeze()
+        return self.supervised_loss(y_predicted, y_true)
 
 
 class Triplet(AbstractModel):
@@ -93,27 +96,37 @@ class Triplet(AbstractModel):
 
     def forward(self, batch):
         enc_anchor = self.model.encoder(batch['anchor_x'])
-        enc_positive = self.model.encoder(batch['positive_x'])
-        enc_negative = self.model.encoder(batch['negative_x'])
+        enc_positive = self.model.encoder(batch['positive_x']).detach()
+        enc_negative = self.model.encoder(batch['negative_x']).detach()
         pred = self.fc(enc_anchor)
         return enc_anchor, enc_positive, enc_negative, pred
 
     def predict(self, batch):
         return self.forward(batch)[3]
 
-    def calculate_loss(self, batch):
-        enc_anchor, enc_positive, enc_negative, y_predicted = self.forward(batch)
-        y_true = self.scaler.inverse_transform(batch['anchor_y'])
-        loss_supervised = masked_mae(y_predicted, y_true, 0.0)
-
+    def pointwise_triplet_loss(self, enc_anchor, enc_positive, enc_negative):
         enc_anchor = F.normalize(enc_anchor, dim=-1)
         enc_positive = F.normalize(enc_positive, dim=-1)
         enc_negative = F.normalize(enc_negative, dim=-1)
         sim_anchor_positive = torch.sum(enc_anchor * enc_positive, dim=-1)  # [batch_size, num_nodes]
         sim_anchor_negative = torch.sum(enc_anchor * enc_negative, dim=-1)  # [batch_size, num_nodes]
-        loss_triplet = torch.mean(torch.max(sim_anchor_negative + self.config.margin - sim_anchor_positive, 0))
+        zeros = torch.zeros_like(sim_anchor_positive).to(self.config.device)
+        margin = torch.ones_like(sim_anchor_positive).to(self.config.device) * self.config.margin
+        loss_triplet = torch.mean(torch.max(sim_anchor_negative + margin - sim_anchor_positive, zeros))
+        return loss_triplet
 
-        return loss_supervised + self.config.beta * loss_triplet
+    def calculate_loss(self, batch, is_valid=False):
+        enc_anchor, enc_positive, enc_negative, y_predicted = self.forward(batch)
+        y_predicted = self.scalar.inverse_transform(y_predicted)
+        y_true = batch['anchor_y'].squeeze()
+        loss_supervised = self.supervised_loss(y_predicted, y_true)
+
+        loss_triplet = self.pointwise_triplet_loss(enc_anchor, enc_positive, enc_negative)
+
+        if is_valid:
+            return loss_supervised
+        else:
+            return loss_supervised + self.config.beta * loss_triplet
 
 class EncDec(AbstractModel):
     def __init__(self, model: AbstractTrafficStateModel, config, scalar):
@@ -121,6 +134,9 @@ class EncDec(AbstractModel):
         self.lstm = nn.LSTM(hidden_size=config.out_dim, input_size=config.enc_dim, batch_first=True)
         self.fc = nn.Linear(config.out_dim, 1)
         self.gnn = SpatioConvLayer(config.Ks, config.out_dim, config.out_dim, config.Lk, config.device)
+        self.norm = nn.LayerNorm([config.num_nodes, config.out_dim])
+        self.align = Align(config.out_dim, config.out_dim)
+        self.relu = nn.ReLU()
 
     def decoder(self, enc):
         '''
@@ -139,7 +155,11 @@ class EncDec(AbstractModel):
             outputs.append(decoder_output.unsqueeze(2))  # (batch_size, num_nodes, 1, out_dim)
             decoder_output = decoder_output.permute(0, 2, 1)
             decoder_output = self.gnn(decoder_output)
-            input_embed = decoder_output.reshape(enc.size()[0] * enc.size()[1], -1)
+            decoder_output = self.norm(decoder_output.transpose(-1, -2))
+            decoder_output = decoder_output.reshape(enc.size()[0] * enc.size()[1], -1)
+            input_embed = input_embed.reshape(enc.size()[0], enc.size()[1], 1, -1).permute(0, 3, 2, 1)
+            input_embed = self.align(input_embed).permute(0, 3, 2, 1).reshape(enc.size()[0] * enc.size()[1], -1)
+            input_embed = self.relu(input_embed + decoder_output)
         return torch.cat(outputs, dim=2)
 
     def forward(self, batch):
@@ -150,42 +170,48 @@ class EncDec(AbstractModel):
     def predict(self, batch):
         return self.forward(batch)
 
-    def calculate_loss(self, batch):
-        y_predicted = self.forward(batch)
-        y_true = self.scaler.inverse_transform(batch['anchor_y'])
-        return masked_mae(y_predicted, y_true, 0.0)
+    def calculate_loss(self, batch, is_valid=False):
+        y_predicted = self.scalar.inverse_transform(self.forward(batch))
+        y_true = batch['anchor_y'].squeeze()
+        return self.supervised_loss(y_predicted, y_true)
 
 
-class DecTriplet(EncDec):
+class DecTriplet(EncDec, Triplet):
     def __init__(self, model: AbstractTrafficStateModel, config, scalar):
         super(DecTriplet, self).__init__(model, config, scalar)
+        self.lin = nn.Linear(self.config.n_pred * self.config.out_dim, self.config.enc_dim)
 
     def forward(self, batch):
         enc_anchor = self.model.encoder(batch['anchor_x'])
-        enc_positive = self.model.encoder(batch['positive_x'])
-        enc_negative = self.model.encoder(batch['negative_x'])
+        enc_positive = self.model.encoder(batch['positive_x']).detach()
+        enc_negative = self.model.encoder(batch['negative_x']).detach()
+        enc_gt = self.model.encoder(batch['anchor_y']).detach()
         dec_anchor = self.decoder(enc_anchor)
         pred = self.fc(dec_anchor).squeeze()
-        return enc_anchor, enc_positive, enc_negative, pred
+        return enc_anchor, enc_positive, enc_negative, enc_gt, dec_anchor, pred
 
-    def triplet_loss(self, sim_anchor, sim_positive, sim_negative):
-        sim_anchor_positive = F.kl_div(sim_anchor, sim_positive, reduction='sum')  # (batch_size, num_nodes)
-        sim_anchor_negative = F.kl_div(sim_anchor, sim_negative, reduction='sum')  # (batch_size, num_nodes)
-        print(sim_anchor_positive.size())
-        return torch.mean(torch.max(sim_anchor_negative + self.config.margin - sim_anchor_positive, 0))
+    def content_loss(self, enc_gt, dec_anchor):
+        dec_anchor = dec_anchor.reshape(dec_anchor.size()[0], dec_anchor.size()[1], -1)
+        dec_anchor = self.lin(dec_anchor)
+        return torch.mean(torch.abs(enc_gt - dec_anchor))
 
-    def calculate_loss(self, batch):
-        enc_anchor, enc_positive, enc_negative, pred = self.forward(batch)
-        sim_anchor = torch.matmul(enc_anchor, enc_anchor.transpose(-1, -2))
-        sim_anchor = torch.softmax(sim_anchor, dim=-1)  # (batch_size, num_nodes, num_nodes)
+    def calculate_loss(self, batch, is_valid=False):
+        enc_anchor, enc_positive, enc_negative, enc_gt, dec_anchor, y_predicted = self.forward(batch)
+        y_predicted = self.scalar.inverse_transform(y_predicted)
+        y_true = batch['anchor_y'].squeeze()
 
-        sim_positive = torch.matmul(enc_positive, enc_positive.transpose(-1, -2))
-        sim_positive = torch.softmax(sim_positive, dim=-1)  # (batch_size, num_nodes, num_nodes)
+        loss_supervised = self.supervised_loss(y_predicted, y_true)
+        loss_triplet = self.pointwise_triplet_loss(enc_anchor, enc_positive, enc_negative)
+        loss_content = self.content_loss(enc_gt, dec_anchor)
 
-        sim_negative = torch.matmul(enc_negative, enc_negative.transpose(-1, -2))
-        sim_negative = torch.softmax(sim_negative, dim=-1)  # (batch_size, num_nodes, num_nodes)
-        # TODO
+        if is_valid:
+            return loss_supervised
+        else:
+            return loss_supervised + self.config.beta * loss_triplet
+            # return loss_supervised + (self.config.beta * loss_triplet + self.config.beta * loss_content) / 2
 
+    def predict(self, batch):
+        return self.forward(batch)[5]
 
 class Config:
     def __init__(self):
@@ -209,12 +235,12 @@ if __name__ == "__main__":
     scalar = StandardScaler(0, 1)
     from models.STGCN import STGCN
     model = STGCN(config)
-    net = EncDec(model, config, scalar)
+    net = DecTriplet(model, config, scalar)
     batch = {
-        'anchor': torch.rand(128, 1124, 12, 1),
-        'positive': torch.rand(128, 1124, 12, 1),
-        'negative': torch.rand(128, 1124, 12, 1),
-        'y': torch.rand(128, 1124, 12)
+        'anchor_x': torch.rand(102, 1125, 12, 1),
+        'positive_x': torch.rand(102, 1125, 12, 1),
+        'negative_x': torch.rand(102, 1125, 12, 1),
+        'anchor_y': torch.rand(102, 1125, 12, 1)
     }
-    out = net(batch)
-    print(out.size())
+    out = net.calculate_loss(batch)
+    print(out)

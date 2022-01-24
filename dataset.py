@@ -6,22 +6,27 @@ import torch
 class TFDataset(Dataset):
     def __init__(self, file_name, scaler=None):
         self.data = np.load(file_name)
-        self.x = np.array(self.data['x'])[:, :, :, 0]
-        self.y = np.array(self.data['y'])[:, :, :, 0]
+        self.x = np.array(self.data['x'])[:, :, :, :1]
+        self.y = np.array(self.data['y'])[:, :, :, :1]
         if scaler != None:
             self.x[..., 0] = scaler.transform(self.x[..., 0])
         self.len = self.x.shape[0]
 
     def __getitem__(self, index):
         # x: [N, T, C] y: [N, T, C]
-        candidate = [index % (288 * 7)]
+        candidate = []
+        if index >= 288 * 7:
+            candidate.append(index % (288 * 7))
         cur = index % (288 * 7)
         while True:
             cur += 288 * 7
             if cur >= self.len:
                 break
-            candidate.append(cur)
-        positive_index = cur[np.random.randint(0, len(cur))]
+            if cur != index:
+                candidate.append(cur)
+        if len(candidate) == 0:
+            candidate.append(index)
+        positive_index = candidate[np.random.randint(0, len(candidate))]
         while True:
             negative_index = np.random.randint(0, self.len)
             if negative_index % (288 * 7) != index % (288 * 7):

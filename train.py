@@ -24,13 +24,13 @@ def get_model(args, scalar):
         raise NotImplementedError
 
     if model == 'BaseLine':
-        net = BaseLine(base_model, config, scalar)
+        net = BaseLine(base_model, args, scalar)
     elif model == 'Triplet':
-        net = Triplet(base_model, config, scalar)
+        net = Triplet(base_model, args, scalar)
     elif model == 'EncDec':
-        net = EncDec(base_model, config, scalar)
+        net = EncDec(base_model, args, scalar)
     elif model == 'DecTriplet':
-        net = DecTriplet(base_model, config, scalar)
+        net = DecTriplet(base_model, args, scalar)
     else:
         raise NotImplementedError
     return net
@@ -43,7 +43,7 @@ def parse_arg():
     parser.add_argument('--data_root', '-data_root', required=True)
     parser.add_argument('--checkpoint', '-checkpoint', required=True)
     parser.add_argument('--n_his', '-n_his', required=False, default=12, type=int, choices=[12])
-    parser.add_argument('--n_pred', '-n_pred', required=False, default=3, type=int, choices=[3, 6, 12])
+    parser.add_argument('--n_pred', '-n_pred', required=False, default=12, type=int, choices=[3, 6, 12])
     parser.add_argument('--epoch', '-epoch', required=False, default=500, type=int)
     parser.add_argument('--enable_earlystop', action='store_true', default=True)
     parser.add_argument('--batch_size', '-batch_size', required=False, default=64, type=int)
@@ -57,7 +57,7 @@ def parse_arg():
     parser.add_argument('--Ks', '-Ks', required=False, default=3, type=int)
     parser.add_argument('--Kt', '-Kt', required=False, default=3, type=int)
     parser.add_argument('--margin', '-margin', required=False, default=1, type=float)
-    parser.add_argument('--beta', '-beta', required=False, default=0.5, type=float)
+    parser.add_argument('--beta', '-beta', required=False, default=5, type=float)
     parser.add_argument('--keep_prob', '-keep_prob', required=False, default=0.5, type=float)
     parser.add_argument('--load_pretrain', '-load_pretrain', required=False, default='', type=str)
     parser.add_argument('--verbose', '-verbose', action='store_true', default=False)
@@ -68,15 +68,16 @@ def parse_arg():
     torch.cuda.set_device(args.device)
     if args.graph_type == 'GCN':
         args.Ks = 1
+    print(args)
     return args
 
 
 def train(args, net, train_loader, val_loader, optimizer, scheduler, early_stopping):
     l_sum = 0
     n_sum = 0
-    net.train()
 
     for i in range(args.epoch):
+        net.train()
         for batch in (tqdm.tqdm(train_loader) if args.verbose else train_loader):
             optimizer.zero_grad()
             batch = {key: batch[key].to(args.device) for key in batch.keys()}
@@ -108,7 +109,7 @@ def val(net, val_loader, device):
 
     for batch in (tqdm.tqdm(val_loader) if args.verbose else val_loader):
         batch = {key: batch[key].to(device) for key in batch.keys()}
-        loss = net.calculate_loss(batch)
+        loss = net.calculate_loss(batch, is_valid=True)
         l_sum += loss.item() * batch['anchor_y'].size()[0]
         n_sum += batch['anchor_y'].size()[0]
     return l_sum / n_sum
@@ -127,7 +128,7 @@ def test(args, net, test_loader, device, scaler):
         batch = {key: batch[key].to(device) for key in batch.keys()}
         out = net.predict(batch).detach().cpu()
         y_pred = scaler.inverse_transform(out)
-        y = batch['anchor_y'].cpu()
+        y = batch['anchor_y'].cpu().squeeze()
         mae, mape, rmse = metric(y_pred, y)
         MAE.append(mae)
         MAPE.append(mape)
@@ -158,20 +159,24 @@ if __name__ == '__main__':
     val_path = os.path.join(args.root, 'val_{}.npz'.format(args.n_pred))
     test_path = os.path.join(args.root, 'test_{}.npz'.format(args.n_pred))
 
-    adj = pickle.load(open(adj_path, 'rb'))
-    args.num_nodes = adj.shape[0]
+
+    adj_mx = pickle.load(open(adj_path, 'rb'))
+    args.num_nodes = adj_mx.shape[0]
+    # Calculate graph kernel
+
     if args.graph_type == 'GCN':
-        args.Lk = scaled_laplacian(adj).reshape(1, args.num_nodes, args.num_nodes)
-    elif args.graph_type == 'ChebNet':
-        W = first_approx(adj, args.num_nodes)
-        args.Lk = cheb_poly_approx(W, args.Ks, args.num_nodes)
+        args.Lk = first_approx(adj_mx, args.num_nodes).reshape(1, args.num_nodes, args.num_nodes)
+    else:
+        args.Lk = scaled_laplacian(adj_mx)
+        args.Lk = cheb_poly_approx(args.Lk, args.Ks, args.num_nodes)
         args.Lk = args.Lk.reshape(args.num_nodes, args.Ks, args.num_nodes).transpose(1, 0)
         
-    args.Lk = torch.from_numpy(args.Lk).to(args.device)
+    args.Lk = torch.from_numpy(args.Lk).to(args.device).reshape(args.Ks, args.num_nodes, args.num_nodes)
+    args.Lk = args.Lk.float()
     args.output_dim = 1
     args.blocks = [[1, 32, 64], [64, 32, 128]]
     args.enc_dim = 128
-    args.dec_dim = 128
+    args.out_dim = 128
 
     train_data = np.array(np.load(train_path)['x'])[:, :, :, 0]
     scaler = StandardScaler(mean=train_data[..., 0].mean(), std=train_data[..., 0].std())
