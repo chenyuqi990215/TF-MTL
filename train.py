@@ -25,6 +25,8 @@ def get_model(args, scalar):
 
     if model == 'BaseLine':
         net = BaseLine(base_model, args, scalar)
+    elif model == 'Classification':
+        net = Classification(base_model, args, scalar)
     elif model == 'Triplet':
         net = Triplet(base_model, args, scalar)
     elif model == 'EncDec':
@@ -61,7 +63,7 @@ def parse_arg():
     parser.add_argument('--keep_prob', '-keep_prob', required=False, default=0.5, type=float)
     parser.add_argument('--load_pretrain', '-load_pretrain', required=False, default='', type=str)
     parser.add_argument('--verbose', '-verbose', action='store_true', default=False)
-    parser.add_argument('--gnn', '-gnn', required=False, default='GCN', choices=['GCN', 'GAT', 'AGC-LSTM'])
+    parser.add_argument('--gnn', '-gnn', required=False, default='GCN', choices=['GCN', 'GAT', 'GCN_AGCLSTM', 'GAT_AGCLSTM'])
     args = parser.parse_args()
     args.root = os.path.join(args.data_root, args.dataset)
     if not args.enable_cuda or not torch.cuda.is_available():
@@ -150,8 +152,12 @@ def setup_seed(seed):
 
 if __name__ == '__main__':
     args = parse_arg()
-
-    seed = 19971125
+    if args.dataset == 'PEMSD8':
+        seed = 19971125
+    elif args.dataset == 'PEMSD4':
+        seed = 19990215
+    else:
+        raise NotImplementedError
     setup_seed(seed)
     print('using seed: {}'.format(seed))
 
@@ -186,9 +192,9 @@ if __name__ == '__main__':
     val_dataset = TFDataset(val_path, scaler)
     test_dataset = TFDataset(test_path, scaler)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=12)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12)
 
     model = get_model(args, scaler)
 

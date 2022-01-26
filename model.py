@@ -5,89 +5,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
-
-
-class Align(nn.Module):
-    def __init__(self, c_in, c_out):
-        super(Align, self).__init__()
-        self.c_in = c_in
-        self.c_out = c_out
-        if c_in > c_out:
-            self.conv1x1 = nn.Conv2d(c_in, c_out, 1)  # filter=(1,1)
-
-    def forward(self, x):  # x: (batch_size, feature_dim(c_in), input_length, num_nodes)
-        if self.c_in > self.c_out:
-            return self.conv1x1(x)
-        if self.c_in < self.c_out:
-            return F.pad(x, [0, 0, 0, 0, 0, self.c_out - self.c_in, 0, 0])
-        return x  # return: (batch_size, c_out, input_length-1+1, num_nodes-1+1)
-
-
-class SpatioConvLayer(nn.Module):
-    def __init__(self, ks, c_in, c_out, lk, device):
-        super(SpatioConvLayer, self).__init__()
-        self.Lk = lk
-        self.theta = nn.Parameter(torch.FloatTensor(c_in, c_out, ks).to(device))  # kernel: C_in*C_out*ks
-        self.b = nn.Parameter(torch.FloatTensor(1, c_out, 1).to(device))
-        self.align = Align(c_in, c_out)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        init.kaiming_uniform_(self.theta, a=math.sqrt(5))
-        fan_in, _ = init._calculate_fan_in_and_fan_out(self.theta)
-        bound = 1 / math.sqrt(fan_in)
-        init.uniform_(self.b, -bound, bound)
-
-    def forward(self, x):
-        x = x.transpose(-1, -2)
-        x_c = torch.einsum("knm,bim->bikn", self.Lk, x)  # delete num_nodes(n)
-        x_gc = torch.einsum("iok,bikn->bon", self.theta, x_c) + self.b  # delete Ks(k) c_in(i)
-        x_in = self.align(x.unsqueeze(1)).squeeze()  # (batch_size, c_out, num_nodes)
-        return torch.relu(x_gc + x_in).transpose(-1, -2)  # residual connection
-
-
-class GraphAttentionLayer(nn.Module):
-    """
-    Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
-    图注意力层
-    """
-
-    def __init__(self, in_features, out_features, dropout=0.2, alpha=0.01):
-        super(GraphAttentionLayer, self).__init__()
-        self.in_features = in_features  # 节点表示向量的输入特征维度
-        self.out_features = out_features  # 节点表示向量的输出特征维度
-        self.dropout = dropout  # dropout参数
-        self.alpha = alpha  # leakyrelu激活的参数
-
-        # 定义可训练参数，即论文中的W和a
-        self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
-        nn.init.xavier_uniform_(self.W.data, gain=1.414)  # xavier初始化
-        self.a = nn.Parameter(torch.zeros(size=(2 * out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)  # xavier初始化
-
-        # 定义leakyrelu激活函数
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
-
-    def forward(self, inp):
-        """
-        implement of global graph attention layer
-        inp: input_fea [N, in_features]  in_features表示节点的输入特征向量元素个数
-        """
-        h = torch.matmul(inp, self.W)  # [B, N, out_features]
-        N = h.size()[1]  # N 图的节点数
-        B = h.size()[0]  # B batch_size
-
-        a_input = torch.cat([h.repeat(1, 1, N).view(B, N * N, -1), h.repeat(1, N, 1)], dim=-1).view(B, N, N, 2 * self.out_features)
-        # [B, N, N, 2*out_features]
-        attention = self.leakyrelu(torch.matmul(a_input, self.a).squeeze())
-        # [B, N, N, 1] => [B, N, N] 图注意力的相关系数（未归一化）
-
-        attention = F.softmax(attention, dim=-1)  # softmax形状保持不变 [N, N]，得到归一化的注意力权重！
-        attention = F.dropout(attention, self.dropout)  # dropout，防止过拟合
-        h_prime = torch.matmul(attention, h)  # [B, N, N].[B, N, out_features] => [B, N, out_features]
-
-        return F.elu(h_prime)
-
+from layer import *
 
 class AbstractModel(nn.Module):
     def __init__(self, model: AbstractTrafficStateModel, config, scalar):
@@ -106,7 +24,11 @@ class AbstractModel(nn.Module):
         pass
 
     def supervised_loss(self, y_predicted, y_true):
-        return masked_mae(y_predicted, y_true, 0.0)
+        loss = masked_mae(y_predicted, y_true, 0.0)
+        if loss.item() > 1000:
+            import pdb
+            pdb.set_trace()
+        return loss
 
 
 class BaseLine(AbstractModel):
@@ -125,6 +47,41 @@ class BaseLine(AbstractModel):
         y_predicted = self.scalar.inverse_transform(self.forward(batch))
         y_true = batch['anchor_y'].squeeze()
         return self.supervised_loss(y_predicted, y_true)
+
+
+class Classification(BaseLine):
+    def __init__(self, model: AbstractTrafficStateModel, config, scalar):
+        super(Classification, self).__init__(model, config, scalar)
+        self.fc = nn.Linear(config.enc_dim, config.n_pred)
+        self.lin = nn.Linear(config.enc_dim, config.enc_dim)
+        self.pool = nn.Linear(config.num_nodes, 1)
+        self.classify = nn.Linear(config.enc_dim, 288)
+
+    def forward(self, batch):
+        enc = self.model.encoder(batch['anchor_x'])
+        pred = self.fc(enc)
+
+        classify = self.classify(self.pool(F.relu(self.lin(enc)).transpose(-1, -2)).squeeze())
+
+        return pred, classify
+
+    def predict(self, batch):
+        return self.forward(batch)[0]
+
+    def time_loss(self, pred, gt):
+        pred = F.softmax(pred, dim=-1)
+        return torch.mean(pred * gt)
+
+    def calculate_loss(self, batch, is_valid=False):
+        y_predicted, classify = self.forward(batch)
+        y_predicted = self.scalar.inverse_transform(y_predicted)
+        y_true = batch['anchor_y'].squeeze()
+
+        if is_valid:
+            return self.supervised_loss(y_predicted, y_true)
+        else:
+            return self.supervised_loss(y_predicted, y_true) \
+                   + self.config.beta * self.time_loss(classify, batch['anchor_t'])
 
 
 class Triplet(AbstractModel):
@@ -169,19 +126,62 @@ class Triplet(AbstractModel):
 class EncDec(AbstractModel):
     def __init__(self, model: AbstractTrafficStateModel, config, scalar):
         super(EncDec, self).__init__(model, config, scalar)
-        self.lstm = nn.LSTM(hidden_size=config.out_dim, input_size=config.enc_dim, batch_first=True)
+
         self.fc = nn.Linear(config.out_dim, 1)
-        if config.gnn == 'GAT':
-            self.gnn = GraphAttentionLayer(config.out_dim, config.out_dim)
-        elif config.gnn == 'GCN':
-            self.gnn = SpatioConvLayer(config.Ks, config.out_dim, config.out_dim, config.Lk, config.device)
+        if 'AGCLSTM' not in config.gnn:
+            self.gnn = get_gnn_model(config)
+            self.lstm = nn.LSTM(hidden_size=config.out_dim, input_size=config.enc_dim, batch_first=True)
         else:
-            raise NotImplementedError
+            self.lstm = AGCLSTM(input_sz=config.enc_dim, hidden_sz=config.out_dim, config=config)
         self.norm = nn.LayerNorm([config.num_nodes, config.out_dim])
         self.align = Align(config.out_dim, config.out_dim)
         self.relu = nn.ReLU()
 
     def decoder_gnn(self, enc):
+        '''
+        :param enc: (batch_size, num_nodes, enc_dim)
+        :return: (batch_size, num_nodes, n_pred, out_dim)
+        '''
+        h = torch.zeros(1, enc.size()[0] * enc.size()[1], self.config.out_dim).to(self.config.device)
+        c = torch.zeros(1, enc.size()[0] * enc.size()[1], self.config.out_dim).to(self.config.device)
+
+        outputs = []
+        input_embed = enc.reshape(enc.size()[0] * enc.size()[1], -1)
+        input_embed = input_embed.unsqueeze(1)
+        for di in range(self.config.n_pred):
+            decoder_output, (h, c) = self.lstm(input_embed, (h, c))  # [batch_size * num_nodes, 1, out_dim]
+            decoder_output = decoder_output.reshape(enc.size()[0], enc.size()[1], -1)
+            outputs.append(decoder_output.unsqueeze(2))  # (batch_size, num_nodes, 1, out_dim)
+            hn = h.reshape(enc.size()[0], enc.size()[1], -1)
+            cn = c.reshape(enc.size()[0], enc.size()[1], -1)
+            hn = self.gnn(hn)
+            cn = self.gnn(cn)
+            hn = self.norm(hn)
+            cn = self.norm(cn)
+            hn = hn.reshape(*h.size())
+            cn = cn.reshape(*c.size())
+            h = self.relu(h + hn)
+            c = self.relu(c + cn)
+        return torch.cat(outputs, dim=2)
+
+    def decode_agclstm(self, enc):
+        '''
+                :param enc: (batch_size, num_nodes, enc_dim)
+                :return: (batch_size, num_nodes, n_pred, out_dim)
+                '''
+        h = torch.zeros(1, enc.size()[0] * enc.size()[1], self.config.out_dim).to(self.config.device)
+        c = torch.zeros(1, enc.size()[0] * enc.size()[1], self.config.out_dim).to(self.config.device)
+
+        outputs = []
+        input_embed = enc.reshape(enc.size()[0] * enc.size()[1], -1)
+        input_embed = input_embed.unsqueeze(1)
+        for di in range(self.config.n_pred):
+            input_embed, (h, c) = self.lstm(input_embed, (h, c))  # [batch_size * num_nodes, 1, out_dim]
+            outputs.append(input_embed.reshape(-1, self.config.num_nodes, 1, self.config.out_dim))
+            # (batch_size, num_nodes, 1, out_dim)
+        return torch.cat(outputs, dim=2)
+
+    def decoder_gnn_v1(self, enc):
         '''
         :param enc: (batch_size, num_nodes, enc_dim)
         :return: (batch_size, num_nodes, n_pred, out_dim)
@@ -204,14 +204,20 @@ class EncDec(AbstractModel):
             input_embed = self.relu(input_embed + decoder_output)
         return torch.cat(outputs, dim=2)
 
-    def forward(self, batch):
-        enc = self.model.encoder(batch['anchor_x'])
-        if self.config.gnn == 'GCN':
+    def decoder(self, enc):
+        if 'AGCLSTM' in self.config.gnn:
+            dec = self.decode_agclstm(enc)
+        elif self.config.gnn == 'GCN':
             dec = self.decoder_gnn(enc)
         elif self.config.gnn == 'GAT':
             dec = self.decoder_gnn(enc)
         else:
             raise NotImplementedError
+        return dec
+
+    def forward(self, batch):
+        enc = self.model.encoder(batch['anchor_x'])
+        dec = self.decoder(enc)
         return self.fc(dec).squeeze()
 
     def predict(self, batch):
@@ -275,7 +281,7 @@ class Config:
         self.out_dim = 128
         self.margin = 1
         self.beta = 0.5
-        self.gnn = 'GCN'
+        self.gnn = 'GCN_AGCLSTM'
 
 if __name__ == "__main__":
     from utils.scaler import StandardScaler
