@@ -19,7 +19,14 @@ def get_model(args, scalar):
         raise NotImplementedError
     if base == 'STGCN':
         from models.STGCN import STGCN
+        from config.STGCN import model_config
+        args = model_config(args)
         base_model = STGCN(args)
+    elif base == 'GWNET':
+        from models.GWNET import GWNET
+        from config.GWNET import model_config
+        args = model_config(args)
+        base_model = GWNET(args)
     else:
         raise NotImplementedError
 
@@ -56,14 +63,14 @@ def parse_arg():
     parser.add_argument('--optimizer', '-optimizer', required=False, default='Adam', type=str, choices=['Adam', 'AdamW', 'RMSProp'])
     parser.add_argument('--graph_type', '-graph_type', required=False, default='GCN', type=str, choices=['GCN', 'ChebNet'])
     parser.add_argument('--model_type', '-model_type', required=True, default='STGCN_BaseLine', type=str)
+    parser.add_argument('--gnn', '-gnn', required=False, default='GCN',
+                        choices=['GCN', 'GAT', 'GCN_AGCLSTM', 'GAT_AGCLSTM'])
     parser.add_argument('--Ks', '-Ks', required=False, default=3, type=int)
     parser.add_argument('--Kt', '-Kt', required=False, default=3, type=int)
     parser.add_argument('--margin', '-margin', required=False, default=1, type=float)
     parser.add_argument('--beta', '-beta', required=False, default=5, type=float)
-    parser.add_argument('--keep_prob', '-keep_prob', required=False, default=0.5, type=float)
     parser.add_argument('--load_pretrain', '-load_pretrain', required=False, default='', type=str)
     parser.add_argument('--verbose', '-verbose', action='store_true', default=False)
-    parser.add_argument('--gnn', '-gnn', required=False, default='GCN', choices=['GCN', 'GAT', 'GCN_AGCLSTM', 'GAT_AGCLSTM'])
     args = parser.parse_args()
     args.root = os.path.join(args.data_root, args.dataset)
     if not args.enable_cuda or not torch.cuda.is_available():
@@ -169,6 +176,7 @@ if __name__ == '__main__':
 
     adj_mx = pickle.load(open(adj_path, 'rb'))
     args.num_nodes = adj_mx.shape[0]
+    args.adj_mx = adj_mx
     # Calculate graph kernel
 
     if args.graph_type == 'GCN':
@@ -180,8 +188,6 @@ if __name__ == '__main__':
         
     args.Lk = torch.from_numpy(args.Lk).to(args.device).reshape(args.Ks, args.num_nodes, args.num_nodes)
     args.Lk = args.Lk.float()
-    args.output_dim = 1
-    args.blocks = [[1, 32, 64], [64, 32, 128]]
     args.enc_dim = 128
     args.out_dim = 128
 

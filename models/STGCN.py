@@ -1,6 +1,4 @@
 import math
-import numpy as np
-from logging import getLogger
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -136,10 +134,6 @@ class STGCN(AbstractTrafficStateModel):
                                   * (config.Kt - 1), config.num_nodes)
 
     def encoder(self, x):
-        '''
-        :param x: (batch_size, num_nodes, input_length, feature_dim)
-        :return: (batch_size, num_nodes, output_dim)
-        '''
         x = x.permute(0, 3, 2, 1)  # (batch_size, feature_dim, input_length, num_nodes)
         x_st1 = self.st_conv1(x)   # (batch_size, c[2](64), input_length-kt+1-kt+1, num_nodes)
         x_st2 = self.st_conv2(x_st1)  # (batch_size, c[2](128), input_length-kt+1-kt+1-kt+1-kt+1, num_nodes)

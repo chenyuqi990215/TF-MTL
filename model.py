@@ -70,6 +70,7 @@ class Classification(BaseLine):
 
     def time_loss(self, pred, gt):
         pred = F.softmax(pred, dim=-1)
+        pred = torch.clip(pred, 1e-6, 1 - 1e-6)
         return torch.mean(pred * gt)
 
     def calculate_loss(self, batch, is_valid=False):
@@ -260,8 +261,8 @@ class DecTriplet(EncDec, Triplet):
         if is_valid:
             return loss_supervised
         else:
-            return loss_supervised + self.config.beta * loss_triplet
-            # return loss_supervised + (self.config.beta * loss_triplet + self.config.beta * loss_content) / 2
+            # return loss_supervised + self.config.beta * loss_triplet
+            return loss_supervised + (self.config.beta * loss_triplet + self.config.beta * loss_content) / 2
 
     def predict(self, batch):
         return self.forward(batch)[5]
@@ -275,6 +276,7 @@ class Config:
         self.Kt = 3
         self.Ks = 1
         self.Lk = torch.rand(1, 1125, 1125)
+        self.adj_mx = torch.rand(1125, 1125)
         self.keep_prob = 0.5
         self.device = "cpu"
         self.enc_dim = 128
@@ -287,8 +289,10 @@ if __name__ == "__main__":
     from utils.scaler import StandardScaler
     config = Config()
     scalar = StandardScaler(0, 1)
-    from models.STGCN import STGCN
-    model = STGCN(config)
+    from models.GWNET import GWNET
+    from config.GWNET import model_config
+    config = model_config(config)
+    model = GWNET(config)
     net = EncDec(model, config, scalar)
     batch = {
         'anchor_x': torch.rand(102, 1125, 12, 1),
