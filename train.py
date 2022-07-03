@@ -27,6 +27,9 @@ def get_model(args, scalar):
         from config.GWNET import model_config
         args = model_config(args)
         base_model = GWNET(args)
+    elif base == 'STG-NCDE':
+        from models.STG_NCDE import make_model
+        base_model = make_model(args.enc_dim, args.num_nodes, "cuda:0", args.n_his, args.n_pred)
     else:
         raise NotImplementedError
 
